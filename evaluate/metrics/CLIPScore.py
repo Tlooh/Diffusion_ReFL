@@ -19,14 +19,19 @@ class CLIPScore(nn.Module):
         # have clip.logit_scale require no grad.
         self.model.logit_scale.requires_grad_(False)
     
-    def score(self, prompt, image_path):
+    def score(self, prompt, image):
+        # support image_path:str or image:Image
+        if isinstance(image, str):
+            image_path = image
+            pil_image = Image.open(image_path)
+        elif isinstance(image, Image.Image):
+            pil_image = image
 
         # text encode
         text = clip.tokenize(prompt, truncate=True).to(self.device)
         text_features = F.normalize(self.model.encode_text(text))
 
         # image encode
-        pil_image = Image.open(image_path)
         image = self.preprocess(pil_image).unsqueeze(0).to(self.device)
         image_features = F.normalize(self.model.encode_image(image))
 
