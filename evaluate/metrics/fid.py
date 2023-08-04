@@ -170,16 +170,18 @@ def main(args):
         act_of_simple = get_pred_act(model, simple_imgs) 
 
         # actually, pred_of_complex.shape[0] = batch_size
+        # shape: [10,2048]
         pred_act1[star_idx:star_idx + act_of_complex.shape[0]] = act_of_complex
         pred_act2[star_idx:star_idx + act_of_simple.shape[0]] = act_of_simple
 
         star_idx = star_idx + act_of_simple.shape[0]
     
     # c. compute_statistics
-
-    # shape: [10,2048]
+    
     complex_statistics = compute_statistics(pred_act1)
     simple_statistics = compute_statistics(pred_act2)
+
+    print(complex_statistics)
 
     fid_value = complex_statistics.frechet_distance(simple_statistics)
     print("FID:", fid_value)
