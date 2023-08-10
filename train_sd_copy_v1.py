@@ -39,7 +39,7 @@ except ImportError:
 
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel, PNDMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
@@ -65,6 +65,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
         "--input_perturbation", type=float, default=0, help="The scale of input perturbation. Recommended 0.1."
+    )
+    parser.add_argument(
+        "--grad_scale", type=float, default=1e-3, help="Scale divided for grad loss value."
     )
     parser.add_argument(
         "--pretrained_model_name_or_path",
@@ -143,7 +146,7 @@ def parse_args():
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
     )
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+    parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
     parser.add_argument(
         "--resolution",
         type=int,
@@ -168,7 +171,7 @@ def parse_args():
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=2, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument(
@@ -412,7 +415,9 @@ def main():
             ).repo_id
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    # noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = PNDMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000)
+
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     )
@@ -447,8 +452,12 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
     )
+    weight_path = "/home/khf/liutao/data/models/weights/ImageReward.pt"
+    state_dict = torch.load(weight_path, map_location="cpu")
     med_config = "/home/khf/liutao/Diffusion_ReFL/configs/bert_config.json"
     reward_model = RM(med_config=med_config, device=accelerator.device).to(accelerator.device)
+    msg = reward_model.load_state_dict(state_dict, strict=False)
+    print("checkpoint loaded")
     reward_model.eval()
 
     # Freeze vae and text_encoder
@@ -641,297 +650,366 @@ def main():
 
 
     def preprocess_train(examples):
-       
         examples["complex_input_ids"] = tokenize_captions(examples, caption_name="complex")
-        
         examples["simple_input_ids"] = tokenize_captions(examples,caption_name="simple")
+        
+        reward_complex_inputs = reward_model.blip_model.tokenizer(examples
+        [complex_caption_column], padding='max_length', truncation=True, max_length=35, return_tensors="pt")
+        examples["rm_complex_input_ids"] = reward_complex_inputs.input_ids
+        examples["rm_complex_attention_mask"] = reward_complex_inputs.attention_mask
+
+        reward_simple_inputs = reward_model.blip_model.tokenizer(examples
+        [simple_caption_column], padding='max_length', truncation=True, max_length=35, return_tensors="pt")
+        examples["rm_simple_input_ids"] = reward_simple_inputs.input_ids
+        examples["rm_simple_attention_mask"] = reward_simple_inputs.attention_mask
 
         return examples
 
-
     with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        # train_dataset = dataset["train"]
-        train_dataset = dataset["train"].with_transform(preprocess_train)
+            if args.max_train_samples is not None:
+                dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+            # Set the training transforms
+            train_dataset = dataset["train"].with_transform(preprocess_train)
     
-    # # Move text_encode and vae to gpu and cast to weight_dtype
-    text_encoder.to(accelerator.device,)
-    vae.to(accelerator.device)
-    unet.to(accelerator.device)
 
-    for example in train_dataset:
-        id = example["id"]
-        complex_prompt = example["complex"]
-        simple_prompt = example["simple"]
-        # complex_input_ids = example["complex_input_ids"]
-        # simple_input_ids = example["simple_input_ids"]
-        
-        print(f"ID: {id}")
-        print(f"Complex prompt: {complex_prompt}")
-        print(f"Simple prompt: {simple_prompt}")
-        # print(f"Complex input_ids: {complex_input_ids}")
-        # print(f"Simple input_ids: {simple_input_ids}")
-        print("=" * 30)
+    def collate_fn(examples):
+        complex_input_ids = torch.stack([example["complex_input_ids"] for example in examples])
+        simple_input_ids = torch.stack([example["simple_input_ids"] for example in examples])
 
-        # complex_input_ids = tokenizer(complex_prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids
+        rm_complex_input_ids = torch.stack([example["rm_complex_input_ids"] for example in examples])
+        rm_complex_attention_mask = torch.stack([example["rm_complex_attention_mask"] for example in examples])
 
-        # simple_input_ids = tokenizer(simple_prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids
+        rm_simple_input_ids = torch.stack([example["rm_simple_input_ids"] for example in examples])
+        rm_simple_attention_mask = torch.stack([example["rm_simple_attention_mask"] for example in examples])
 
-        # print(complex_input_ids)
-        # print(complex_input_ids.shape)
+        complex_input_ids = complex_input_ids.view(-1, complex_input_ids.shape[-1])
+        simple_input_ids = simple_input_ids.view(-1, simple_input_ids.shape[-1])
 
-        complex_input_ids = example["complex_input_ids"].unsqueeze(0)
-        simple_input_ids = example["simple_input_ids"].unsqueeze(0)
-        print(complex_input_ids.shape)
+        rm_complex_input_ids = rm_complex_input_ids.view(-1, rm_complex_input_ids.shape[-1])
+        rm_complex_attention_mask = rm_complex_attention_mask.view(-1, rm_complex_attention_mask.shape[-1])
 
-        complex_encoder_hidden_states = text_encoder(complex_input_ids.to(accelerator.device))[0]
-        simple_encoder_hidden_states = text_encoder(simple_input_ids.to(accelerator.device))[0]
-        cond_prompt_embeds = torch.cat((complex_encoder_hidden_states, simple_encoder_hidden_states),dim=0)
+        rm_simple_input_ids = rm_simple_input_ids.view(-1, rm_simple_input_ids.shape[-1])
+        rm_simple_attention_mask = rm_simple_attention_mask.view(-1, rm_simple_attention_mask.shape[-1])
 
-        uncond_input = tokenizer(
-        [""] * 2, padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
-        negative_prompt_embeds = text_encoder(
-                uncond_input.input_ids.to(accelerator.device),
-                uncond_input.attention_mask.to(accelerator.device)
-                )[0]
-        
-        text_embeddings = torch.cat([negative_prompt_embeds, cond_prompt_embeds])
-        print(text_embeddings.shape)
-
-        # we generate the initial random noise.
-        guidance_scale = 7.5
-        latents = torch.randn(
-            (2, 4, 64, 64)
+        return {"complex_input_ids": complex_input_ids, "simple_input_ids": simple_input_ids,"rm_complex_input_ids": rm_complex_input_ids, "rm_complex_attention_mask": rm_complex_attention_mask,"rm_simple_input_ids": rm_simple_input_ids, "rm_simple_attention_mask": rm_simple_attention_mask}
+    
+    # DataLoaders creation:
+    train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            shuffle=True,
+            collate_fn=collate_fn,
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
         )
-        latents = latents.to(accelerator.device)
-        noise_scheduler.set_timesteps(50, device=accelerator.device)
-        timesteps = noise_scheduler.timesteps
-
-        for i, t in enumerate(timesteps):
-            latent_model_input = torch.cat([latents] * 2)
-            latent_model_input = noise_scheduler.scale_model_input(latent_model_input, timestep=t)
-
-            # predict the noise residual
-            with torch.no_grad():
-                noise_pred = unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
-
-            # perform guidance
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-            # compute the previous noisy sample x_t -> x_t-1
-            latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
-        
-
-        # scale and decode the image latents with vae
-        latents = 1 / 0.18215 * latents
-        with torch.no_grad():
-            image = vae.decode(latents).sample
-
-
-        image = (image / 2 + 0.5).clamp(0, 1)
-        image = image.detach().cpu().permute(0, 2, 3, 1).numpy() # (1, 512, 512, 3)
-        images = (image * 255).round().astype("uint8")
-        pil_images = [Image.fromarray(image) for image in images]
-
-        pil_images[0].save(f"/home/khf/liutao/data/outputs/{id}_complex.png")
-        pil_images[1].save(f"/home/khf/liutao/data/outputs/{id}_simple.png")
-        print("save successfully!")
-
-
-    # def collate_fn(examples):
-    #     complex_input_ids = torch.stack([example["complex_input_ids"] for example in examples])
-    #     simple_input_ids = torch.stack([example["simple_input_ids"] for example in examples])
-
-    #     complex_input_ids = complex_input_ids.view(-1, complex_input_ids.shape[-1])
-    #     simple_input_ids = simple_input_ids.view(-1, simple_input_ids.shape[-1])
-
-    #     return {"complex_input_ids": complex_input_ids, "simple_input_ids": simple_input_ids}
     
-    # train_dataloader = torch.utils.data.DataLoader(
-    #         train_dataset,
-    #         shuffle=True,
-    #         collate_fn=collate_fn,
-    #         batch_size=args.train_batch_size,
-    #         num_workers=args.dataloader_num_workers,
-    #     )
+    # Scheduler and math around the number of training steps.
+    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        overrode_max_train_steps = True
+
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+    )
+
+    # Prepare everything with our `accelerator`.
+    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, train_dataloader, lr_scheduler
+    )
+
+    if args.use_ema:
+        ema_unet.to(accelerator.device)
     
+    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
+    # as these weights are only used for inference, keeping weights in full precision is not required.
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+        args.mixed_precision = accelerator.mixed_precision
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+        args.mixed_precision = accelerator.mixed_precision
     
-    # # Scheduler and math around the number of training steps.
-    # overrode_max_train_steps = False
-    # num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    # if args.max_train_steps is None:
-    #     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    #     overrode_max_train_steps = True
 
-    # lr_scheduler = get_scheduler(
-    #     args.lr_scheduler,
-    #     optimizer=optimizer,
-    #     num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-    #     num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
-    # )
+    # Move text_encode and vae to gpu and cast to weight_dtype
+    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    vae.to(accelerator.device, dtype=weight_dtype)
+    reward_model.to(accelerator.device, dtype=weight_dtype)
 
-    # # Prepare everything with our `accelerator`.
-    # unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-    #     unet, optimizer, train_dataloader, lr_scheduler
-    # )
 
-    # if args.use_ema:
-    #     ema_unet.to(accelerator.device)
+    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if overrode_max_train_steps:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    # Afterwards we recalculate our number of training epochs
+    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-    # # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
-    # # as these weights are only used for inference, keeping weights in full precision is not required.
-    # weight_dtype = torch.float32
-    # if accelerator.mixed_precision == "fp16":
-    #     weight_dtype = torch.float16
-    #     args.mixed_precision = accelerator.mixed_precision
-    # elif accelerator.mixed_precision == "bf16":
-    #     weight_dtype = torch.bfloat16
-    #     args.mixed_precision = accelerator.mixed_precision
-
-    # # Move text_encode and vae to gpu and cast to weight_dtype
-    # text_encoder.to(accelerator.device, dtype=weight_dtype)
-    # vae.to(accelerator.device, dtype=weight_dtype)
-    # reward_model.to(accelerator.device, dtype=weight_dtype)
-
-    # # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    # num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    # if overrode_max_train_steps:
-    #     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # # Afterwards we recalculate our number of training epochs
-    # args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-    # # We need to initialize the trackers we use, and also store our configuration.
-    # # The trackers initializes automatically on the main process.
-    # if accelerator.is_main_process:
-    #     tracker_config = dict(vars(args))
-    #     tracker_config.pop("validation_prompts")
-    #     accelerator.init_trackers(args.tracker_project_name, tracker_config)
-
-    # # Train!
-    # total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-
-    # logger.info("***** Running training *****")
-    # logger.info(f"  Num examples = {len(train_dataset)}")
-    # logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    # logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    # logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    # logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    # logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    # global_step = 0
-    # first_epoch = 0
-
-    # # Potentially load in the weights and states from a previous save
-    # if args.resume_from_checkpoint:
-    #     if args.resume_from_checkpoint != "latest":
-    #         path = os.path.basename(args.resume_from_checkpoint)
-    #     else:
-    #         # Get the most recent checkpoint
-    #         dirs = os.listdir(args.output_dir)
-    #         dirs = [d for d in dirs if d.startswith("checkpoint")]
-    #         dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-    #         path = dirs[-1] if len(dirs) > 0 else None
-
-    #     if path is None:
-    #         accelerator.print(
-    #             f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
-    #         )
-    #         args.resume_from_checkpoint = None
-    #     else:
-    #         accelerator.print(f"Resuming from checkpoint {path}")
-    #         accelerator.load_state(os.path.join(args.output_dir, path))
-    #         global_step = int(path.split("-")[1])
-
-    #         resume_global_step = global_step * args.gradient_accumulation_steps
-    #         first_epoch = global_step // num_update_steps_per_epoch
-    #         resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
+    # We need to initialize the trackers we use, and also store our configuration.
+    # The trackers initializes automatically on the main process.
+    if accelerator.is_main_process:
+        tracker_config = dict(vars(args))
+        tracker_config.pop("validation_prompts")
+        accelerator.init_trackers(args.tracker_project_name, tracker_config)
     
-    # # Only show the progress bar once on each machine.
-    # progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
-    # progress_bar.set_description("Steps")
+   
+    # Train!
+    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
-    # guidance_scale = 7.5
-    # do_classifier_free_guidance = guidance_scale > 1.0
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    global_step = 0
+    first_epoch = 0
 
-    # for epoch in range(first_epoch, args.num_train_epochs):
-    #     unet.train()
-    #     train_loss = 0.0
-    #     for step, batch in enumerate(train_dataloader):
-    #         # Skip steps until we reach the resumed step
-    #         if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
-    #             if step % args.gradient_accumulation_steps == 0:
-    #                 progress_bar.update(1)
-    #             continue
-            
-    #         print("step: ", step,"\n","batch:",batch)
-    #         # print("step: ", step)
+    generator = torch.Generator(device=accelerator.device).manual_seed(42)
+    guidance_scale = 7.5
+    do_classifier_free_guidance = guidance_scale > 1.0 
 
-          
-    #         complex_encoder_hidden_states = text_encoder(batch["complex_input_ids"])[0]
-    #         print(complex_encoder_hidden_states.shape)
-    #         simple_encoder_hidden_states = text_encoder(batch["simple_input_ids"])[0]
-            
-    #         cond_prompt_embeds = torch.cat((complex_encoder_hidden_states, simple_encoder_hidden_states), dim=0)
+    # Potentially load in the weights and states from a previous save
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint != "latest":
+            path = os.path.basename(args.resume_from_checkpoint)
+        else:
+            # Get the most recent checkpoint
+            dirs = os.listdir(args.output_dir)
+            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+            path = dirs[-1] if len(dirs) > 0 else None
 
-    #         print(cond_prompt_embeds.shape)
+        if path is None:
+            accelerator.print(
+                f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
+            )
+            args.resume_from_checkpoint = None
+        else:
+            accelerator.print(f"Resuming from checkpoint {path}")
+            accelerator.load_state(os.path.join(args.output_dir, path))
+            global_step = int(path.split("-")[1])
 
-    #         uncond_input = tokenizer(
-    #         [""] * 2, padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
-    #         negative_prompt_embeds = text_encoder(
-    #             uncond_input.input_ids.to(accelerator.device),
-    #             uncond_input.attention_mask.to(accelerator.device)
-    #         )[0]
+            resume_global_step = global_step * args.gradient_accumulation_steps
+            first_epoch = global_step // num_update_steps_per_epoch
+            resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
+    
+    # Only show the progress bar once on each machine.
+    progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar.set_description("Steps")
 
-    #         prompt_embeds = torch.cat([negative_prompt_embeds, cond_prompt_embeds])
-    #         print(prompt_embeds.shape)
+    for epoch in range(first_epoch, args.num_train_epochs):
+        unet.train()
+        train_loss = 0.0
+        for step, batch in enumerate(train_dataloader):
+            # Skip steps until we reach the resumed step
+            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
+                if step % args.gradient_accumulation_steps == 0:
+                    progress_bar.update(1)
+                continue
 
-    #         # 随机初始化 batch 个 latents
-    #         # latents = torch.randn((2, 4, 64, 64), device=accelerator.device)
-    #         latents = torch.randn(
-    #             (1, unet.in_channels, 64, 64),
+            with accelerator.accumulate(unet):
+                id = step
+                print("=" * 30)
+                complex_losses = []
+                simple_losses = []
+
+                for i in range(len(batch["complex_input_ids"])):
+                    complex_input_ids = batch["complex_input_ids"][i].unsqueeze(0)
+                    simple_input_ids = batch["simple_input_ids"][i].unsqueeze(0)
+
+                    # Get the text embedding for conditioning
+                    complex_encoder_hidden_states = text_encoder(complex_input_ids.to(accelerator.device))[0]
+                    simple_encoder_hidden_states = text_encoder(simple_input_ids.to(accelerator.device))[0]
+
+                    cond_prompt_embeds = torch.cat((complex_encoder_hidden_states, simple_encoder_hidden_states),dim=0)
+
+                    uncond_input = tokenizer(
+                    [""] * 2, padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
+                    negative_prompt_embeds = text_encoder(
+                            uncond_input.input_ids.to(accelerator.device),
+                            # uncond_input.attention_mask.to(accelerator.device)
+                            )[0]
                 
-    #         ).to(accelerator.device)
-
-    #         # 设置噪声模型的时间步数，从而决定模型在每个时间步长上的噪声情况。
-    #         noise_scheduler.set_timesteps(50, device=accelerator.device)
-    #         timesteps = noise_scheduler.timesteps
-
-    #         for i, t in enumerate(timesteps):
-    #             latent_model_input = torch.cat([latents] * 2)
-
-    #             latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
-                
-    #             with torch.no_grad():
                     
-    #                 noise_pred = unet(
-    #                     latent_model_input,
-    #                     t,
-    #                     encoder_hidden_states=prompt_embeds,
-    #                     ).sample
-                        
-    #             # perform guidance
-    #             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-    #             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    text_embeddings = torch.cat([negative_prompt_embeds, cond_prompt_embeds])
+                
+                    # we generate the initial random noise.
+                    guidance_scale = 7.5
+                    latents = torch.randn((2, 4, 64, 64), generator=generator,device=accelerator.device).to(accelerator.device)
 
-    #             # compute the previous noisy sample x_t -> x_t-1
-    #             latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
+                    latents = latents * noise_scheduler.init_noise_sigma
+
+                    noise_scheduler.set_timesteps(50, device=accelerator.device)
+                    timesteps = noise_scheduler.timesteps
+
+                    for i, t in enumerate(timesteps):
+                        latent_model_input = torch.cat([latents] * 2)
+
+                        latent_model_input = noise_scheduler.scale_model_input(latent_model_input, timestep=t)
+                        # predict the noise residual
+                        with torch.no_grad():
+                            noise_pred = unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+                            
+                        # perform guidance
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                        # compute the previous noisy sample x_t -> x_t-1
+                        latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
+                    
+                    # latent_model_input = torch.cat([latents] * 2)
+                    
+                    # latent_model_input = noise_scheduler.scale_model_input(latent_model_input, timestep=timesteps[49])
+                    
+                    # noise_pred = unet(latent_model_input, timesteps[49], encoder_hidden_states=text_embeddings).sample
+
+                    # # perform guidance
+                    # noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    # noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                    # # compute the previous noisy sample x_t -> x_t-1
+                    # latents = noise_scheduler.step(noise_pred, t, latents).pred_original_sample.to(weight_dtype)
+
+                    latents = 1 / 0.18215 * latents 
+                    image = vae.decode(latents).sample
+                    image = (image / 2 + 0.5).clamp(0, 1)
+                    
+                    image = image.detach().cpu().permute(0, 2, 3, 1).numpy() # (1, 512, 512, 3)
+                    print(image.shape)
+                    images = (image * 255).round().astype("uint8")
+                    pil_images = [Image.fromarray(image) for image in images]
+
+                    pil_images[0].save(f"/home/khf/liutao/data/outputs/{id}_complex.png")
+                    pil_images[1].save(f"/home/khf/liutao/data/outputs/{id}_simple.png")
+                    print("save successfully!")
+                    
+                    # # scale and decode the image latents with vae
+                    # latents = 1 / 0.18215 * latents
+                    
+                    # image = vae.decode(latents.to(weight_dtype)).sample
+
+                    # image = (image / 2 + 0.5).clamp(0, 1) # [batch,3,512,512]
+           
+                
+    #                 # image encode
+    #                 def _transform():
+    #                     return Compose([
+    #                         Resize(224, interpolation=BICUBIC),
+    #                         CenterCrop(224),
+    #                         Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+    #                     ])
+                
+    #                 rm_preprocess = _transform()
+    #                 image = rm_preprocess(image).to(accelerator.device)
+    #                 complex_image = image[0].unsqueeze(0)
+    #                 simple_image = image[1].unsqueeze(0)
+
+    #                 print(complex_image.shape)
+    #                 complex_rewards = reward_model.score_gard(batch["rm_complex_input_ids"], batch["rm_complex_attention_mask"], complex_image)
+
+    #                 simple_rewards = reward_model.score_gard(batch["rm_simple_input_ids"], batch["rm_simple_attention_mask"], complex_image)
+
+    #                 # print("complex rewards:",complex_rewards)
+    #                 # print("simple rewards:",simple_rewards)
+
+    #                 complex_loss = F.relu(complex_rewards+2)
+    #                 simple_loss = F.relu(simple_rewards+2)
+
+    #                 complex_losses.append(complex_loss)
+    #                 simple_losses.append(simple_losses)
+
+    #             print("complex loss:",complex_loss)
+    #             print("simple loss:",simple_loss)
+                    
+    #             # loss = F.relu(-rewards+2)
+    #             complex_loss = complex_loss.mean() * args.grad_scale
+    #             simple_loss = simple_loss.mean() * args.grad_scale
+
+    #             print("complex loss:",complex_loss)
+    #             print("simple loss:",simple_loss)
+    #             print(complex_loss.requires_grad)
+    #             print(simple_loss.requires_grad)
+    #             loss = complex_loss
+
+    #             # Gather the losses across all processes for logging (if we use distributed training).
+    #             avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+    #             train_loss += avg_loss.item() / args.gradient_accumulation_steps
+
+    #             # Backpropagate
+    #             accelerator.backward(loss)
+    #             if accelerator.sync_gradients:
+    #                 accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+    #             optimizer.step()
+    #             lr_scheduler.step()
+    #             optimizer.zero_grad()
+            
+    #         # Checks if the accelerator has performed an optimization step behind the scenes
+    #         if accelerator.sync_gradients:
+    #             if args.use_ema:
+    #                 ema_unet.step(unet.parameters())
+    #             progress_bar.update(1)
+    #             global_step += 1
+    #             accelerator.log({"train_loss": train_loss}, step=global_step)
+    #             train_loss = 0.0
+            
+    #             if global_step % args.checkpointing_steps == 0:
+    #                 if accelerator.is_main_process:
+    #                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+    #                     accelerator.save_state(save_path)
+    #                     logger.info(f"Saved state to {save_path}")
+            
+    #         logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+    #         progress_bar.set_postfix(**logs)
+
+    #         if global_step >= args.max_train_steps:
+    #             break
+            
+        
+    #     if accelerator.is_main_process:
+    #         if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
+    #             if args.use_ema:
+    #                 # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+    #                 ema_unet.store(unet.parameters())
+    #                 ema_unet.copy_to(unet.parameters())
+               
+    #             if args.use_ema:
+    #                 # Switch back to the original UNet parameters.
+    #                 ema_unet.restore(unet.parameters())
         
 
-    #         pred_original_sample = latents
-    #         pred_original_sample = 1 / vae.config.scaling_factor * pred_original_sample
-    #         image = vae.decode(pred_original_sample.to(weight_dtype)).sample
-    #         image = (image / 2 + 0.5).clamp(0, 1)
+    #  # Create the pipeline using the trained modules and save it.
+    # accelerator.wait_for_everyone()
+    # if accelerator.is_main_process:
+    #     unet = accelerator.unwrap_model(unet)
+    #     if args.use_ema:
+    #         ema_unet.copy_to(unet.parameters())
 
-    #         image = image.detach().cpu().permute(0, 2, 3, 1).numpy() # (1, 512, 512, 3)
-    #         images = (image * 255).round().astype("uint8")
-    #         pil_images = [Image.fromarray(image) for image in images]
+    #     pipeline = StableDiffusionPipeline.from_pretrained(
+    #         args.pretrained_model_name_or_path,
+    #         text_encoder=text_encoder,
+    #         vae=vae,
+    #         unet=unet,
+    #         revision=args.revision,
+    #     )
+    #     pipeline.save_pretrained(args.output_dir)
 
-    #         pil_images[0].save(f"/home/khf/liutao/data/outputs/{step}_complex.png")
-    #         pil_images[1].save(f"/home/khf/liutao/data/outputs/{step}_simple.png")
-    #         print("save successfully!")
+    #     if args.push_to_hub:
+    #         upload_folder(
+    #             repo_id=repo_id,
+    #             folder_path=args.output_dir,
+    #             commit_message="End of training",
+    #             ignore_patterns=["step_*", "epoch_*"],
+    #         )
 
+    accelerator.end_training()
 
+    
+    
+    
 if __name__ == "__main__":
     main()
