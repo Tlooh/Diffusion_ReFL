@@ -66,7 +66,7 @@ print("第二个图片和文本的相似性得分:", similarity2.item())
 
 # accelerate launch --mixed_precision="fp16"  train_text_to_image.py \
 #   --pretrained_model_name_or_path="CompVis/stable-diffusion-v1-4" \
-#   --dataset_name="/home/khf/liutao/Diffusion_ReFL/data/pokemon-blip-captions" \
+#   --dataset_name="/home/khf/liutao/Datasets/pokemon-blip-captions" \
 #   --use_ema \
 #   --resolution=512 --center_crop --random_flip \
 #   --train_batch_size=2 \
@@ -77,3 +77,17 @@ print("第二个图片和文本的相似性得分:", similarity2.item())
 #   --max_grad_norm=1 \
 #   --lr_scheduler="constant" --lr_warmup_steps=0 \
 #   --output_dir="sd-pokemon-model" 
+
+# accelerate launch --multi_gpu --mixed_precision=fp16 --num_processes=2 train_sd_copy_v2.py\
+#   --use_ema \
+#   --resolution=512 --center_crop --random_flip \
+#   --train_batch_size=1 \
+#   --gradient_accumulation_steps=4 \
+#   --gradient_checkpointing \
+#   --max_train_steps=100 \
+#   --learning_rate=1e-05 \
+#   --max_grad_norm=1 \
+#   --lr_scheduler="constant" --lr_warmup_steps=0 \
+#   --output_dir="checkpoint/refl" \
+#   --grad_scale 0.001 \
+#   --checkpointing_steps 10

@@ -26,6 +26,18 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.utils import ContextManagers
 
+
+from PIL import Image
+from  MyReward import MyReward as RM
+
+from torchvision.transforms import Compose, Resize, CenterCrop, Normalize
+try:
+    from torchvision.transforms import InterpolationMode
+    BICUBIC = InterpolationMode.BICUBIC
+except ImportError:
+    BICUBIC = Image.BICUBIC
+
+
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
@@ -53,6 +65,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
         "--input_perturbation", type=float, default=0, help="The scale of input perturbation. Recommended 0.1."
+    )
+    parser.add_argument(
+        "--grad_scale", type=float, default=1e-3, help="Scale divided for grad loss value."
     )
     parser.add_argument(
         "--pretrained_model_name_or_path",
@@ -85,9 +100,9 @@ def parse_args():
         help="The config of the Dataset, leave as None if there's only one config.",
     )
     parser.add_argument(
-        "--train_data_dir",
+        "--train_data_path",
         type=str,
-        default=None,
+        default="/home/khf/liutao/data/prompts/prompts.json",
         help=(
             "A folder containing the training data. Folder contents must follow the structure described in"
             " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
@@ -95,13 +110,13 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--image_column", type=str, default="image", help="The column of the dataset containing an image."
+        "--complex_caption_column", type=str, default="complex", help="The column of the dataset containing a caption or a list of complex caption."
     )
     parser.add_argument(
-        "--caption_column",
+        "--simple_caption_column",
         type=str,
-        default="text",
-        help="The column of the dataset containing a caption or a list of captions.",
+        default="simple",
+        help="The column of the dataset containing a caption or a list of simple captions.",
     )
     parser.add_argument(
         "--max_train_samples",
@@ -156,9 +171,9 @@ def parse_args():
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
     )
-    parser.add_argument("--num_train_epochs", type=int, default=100)
+    parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -336,7 +351,7 @@ def parse_args():
         args.local_rank = env_local_rank
 
     # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
+    if args.dataset_name is None and args.train_data_path is None:
         raise ValueError("Need either a dataset name or a training folder.")
 
     # default to using the same revision for the non-ema model if not specified
@@ -435,10 +450,19 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
     )
+    weight_path = "/home/khf/liutao/Diffusion_ReFL/models/weights/ImageReward.pt"
+    state_dict = torch.load(weight_path, map_location="cpu")
+    med_config = "/home/khf/liutao/Diffusion_ReFL/configs/bert_config.json"
+    reward_model = RM(med_config=med_config, device=accelerator.device).to(accelerator.device)
+    msg = reward_model.load_state_dict(state_dict, strict=False)
+    print("checkpoint loaded")
+    reward_model.eval()
 
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
+    reward_model.requires_grad_(False)
+
 
     # Create EMA for the unet.
     if args.use_ema:
@@ -566,10 +590,9 @@ def main():
         )
     else:
         data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
+        data_files["train"] = args.train_data_path
         dataset = load_dataset(
-            "imagefolder",
+            "json",
             data_files=data_files,
             cache_dir=args.cache_dir,
         )
@@ -579,30 +602,35 @@ def main():
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
     column_names = dataset["train"].column_names
-
+    # print(column_names)
     # 6. Get the column names for input/target.
     dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if args.image_column is None:
-        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
+    if args.complex_caption_column is None:
+        complex_caption_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
     else:
-        image_column = args.image_column
-        if image_column not in column_names:
+        complex_caption_column = args.complex_caption_column
+        if complex_caption_column not in column_names:
             raise ValueError(
-                f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
+                f"--complex_caption_column' value '{args.complex_caption_column}' needs to be one of: {', '.join(column_names)}"
             )
-    if args.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
+    if args.simple_caption_column is None:
+        simple_caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
     else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
+        simple_caption_column = args.simple_caption_column
+        if simple_caption_column not in column_names:
             raise ValueError(
-                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
+                f"--caption_column' value '{args.simple_caption_column}' needs to be one of: {', '.join(column_names)}"
             )
 
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
-    def tokenize_captions(examples, is_train=True):
+    def tokenize_captions(examples, caption_name = "complex",is_train=True):
         captions = []
+        if caption_name == "complex":
+            caption_column = "complex"
+        else:
+            caption_column = "simple"
+
         for caption in examples[caption_column]:
             if isinstance(caption, str):
                 captions.append(caption)
@@ -618,44 +646,60 @@ def main():
         )
         return inputs.input_ids
 
-    # Preprocessing the datasets.
-    train_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
 
     def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image) for image in images]
-        examples["input_ids"] = tokenize_captions(examples)
+        examples["complex_input_ids"] = tokenize_captions(examples, caption_name="complex")
+        examples["simple_input_ids"] = tokenize_captions(examples,caption_name="simple")
+        
+        reward_complex_inputs = reward_model.blip_model.tokenizer(examples
+        [complex_caption_column], padding='max_length', truncation=True, max_length=35, return_tensors="pt")
+        examples["rm_complex_input_ids"] = reward_complex_inputs.input_ids
+        examples["rm_complex_attention_mask"] = reward_complex_inputs.attention_mask
+
+        reward_simple_inputs = reward_model.blip_model.tokenizer(examples
+        [simple_caption_column], padding='max_length', truncation=True, max_length=35, return_tensors="pt")
+        examples["rm_simple_input_ids"] = reward_simple_inputs.input_ids
+        examples["rm_simple_attention_mask"] = reward_simple_inputs.attention_mask
+
         return examples
 
     with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
+            if args.max_train_samples is not None:
+                dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+            # Set the training transforms
+            train_dataset = dataset["train"].with_transform(preprocess_train)
+    
 
     def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        input_ids = torch.stack([example["input_ids"] for example in examples])
-        return {"pixel_values": pixel_values, "input_ids": input_ids}
+        complex_input_ids = torch.stack([example["complex_input_ids"] for example in examples])
+        simple_input_ids = torch.stack([example["simple_input_ids"] for example in examples])
 
+        rm_complex_input_ids = torch.stack([example["rm_complex_input_ids"] for example in examples])
+        rm_complex_attention_mask = torch.stack([example["rm_complex_attention_mask"] for example in examples])
+
+        rm_simple_input_ids = torch.stack([example["rm_simple_input_ids"] for example in examples])
+        rm_simple_attention_mask = torch.stack([example["rm_simple_attention_mask"] for example in examples])
+
+        complex_input_ids = complex_input_ids.view(-1, complex_input_ids.shape[-1])
+        simple_input_ids = simple_input_ids.view(-1, simple_input_ids.shape[-1])
+
+        rm_complex_input_ids = rm_complex_input_ids.view(-1, rm_complex_input_ids.shape[-1])
+        rm_complex_attention_mask = rm_complex_attention_mask.view(-1, rm_complex_attention_mask.shape[-1])
+
+        rm_simple_input_ids = rm_simple_input_ids.view(-1, rm_simple_input_ids.shape[-1])
+        rm_simple_attention_mask = rm_simple_attention_mask.view(-1, rm_simple_attention_mask.shape[-1])
+
+        return {"complex_input_ids": complex_input_ids, "simple_input_ids": simple_input_ids,"rm_complex_input_ids": rm_complex_input_ids, "rm_complex_attention_mask": rm_complex_attention_mask,"rm_simple_input_ids": rm_simple_input_ids, "rm_simple_attention_mask": rm_simple_attention_mask}
+    
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=collate_fn,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-    )
-
+            train_dataset,
+            shuffle=True,
+            collate_fn=collate_fn,
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+        )
+    
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -677,7 +721,7 @@ def main():
 
     if args.use_ema:
         ema_unet.to(accelerator.device)
-
+    
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
@@ -687,10 +731,13 @@ def main():
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
         args.mixed_precision = accelerator.mixed_precision
+    
 
     # Move text_encode and vae to gpu and cast to weight_dtype
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
+    reward_model.to(accelerator.device, dtype=weight_dtype)
+
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -705,7 +752,8 @@ def main():
         tracker_config = dict(vars(args))
         tracker_config.pop("validation_prompts")
         accelerator.init_trackers(args.tracker_project_name, tracker_config)
-
+    
+   
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -718,6 +766,10 @@ def main():
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
     first_epoch = 0
+
+    generator = torch.Generator(device=accelerator.device).manual_seed(0)
+    guidance_scale = 7.5
+    do_classifier_free_guidance = guidance_scale > 1.0 
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
@@ -743,7 +795,7 @@ def main():
             resume_global_step = global_step * args.gradient_accumulation_steps
             first_epoch = global_step // num_update_steps_per_epoch
             resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
-
+    
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
@@ -757,67 +809,143 @@ def main():
                 if step % args.gradient_accumulation_steps == 0:
                     progress_bar.update(1)
                 continue
-
+            
             with accelerator.accumulate(unet):
-                # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
+                id = step
+                complex_input_ids = batch["complex_input_ids"]
+                simple_input_ids = batch["simple_input_ids"]
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                if args.noise_offset:
-                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                    noise += args.noise_offset * torch.randn(
-                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
-                    )
-                if args.input_perturbation:
-                    new_noise = noise + args.input_perturbation * torch.randn_like(noise)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
-
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                if args.input_perturbation:
-                    noisy_latents = noise_scheduler.add_noise(latents, new_noise, timesteps)
-                else:
-                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                
+                # print(f"ID: {id}")
+                print("=" * 30)
+                print(complex_input_ids.shape)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                complex_encoder_hidden_states = text_encoder(complex_input_ids.to(accelerator.device))[0]
+                simple_encoder_hidden_states = text_encoder(simple_input_ids.to(accelerator.device))[0]
 
-                # Get the target for loss depending on the prediction type
-                if args.prediction_type is not None:
-                    # set prediction_type of scheduler if defined
-                    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+                # cond_prompt_embeds = torch.cat((complex_encoder_hidden_states, simple_encoder_hidden_states),dim=0)
 
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                uncond_input = tokenizer(
+                [""] * args.train_batch_size, padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
+                negative_prompt_embeds = text_encoder(
+                        uncond_input.input_ids.to(accelerator.device),
+                        uncond_input.attention_mask.to(accelerator.device)
+                        )[0]
+                
+                complex_text_embeddings = torch.cat([negative_prompt_embeds, complex_encoder_hidden_states])
+                simple_text_embeddings = torch.cat([negative_prompt_embeds, simple_encoder_hidden_states])
+                print(complex_text_embeddings.shape)
 
-                # Predict the noise residual and compute loss
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                # we generate the initial random noise.
+                guidance_scale = 7.5
+                latents = torch.randn((args.train_batch_size, 4, 64, 64), generator=generator,device=accelerator.device)
+                latents = latents.to(accelerator.device)
 
-                if args.snr_gamma is None:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                else:
-                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                    # This is discussed in Section 4.2 of the same paper.
-                    snr = compute_snr(timesteps)
-                    mse_loss_weights = (
-                        torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
-                    )
-                    # We first calculate the original loss. Then we mean over the non-batch dimensions and
-                    # rebalance the sample-wise losses with their respective loss weights.
-                    # Finally, we take the mean of the rebalanced loss.
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                    loss = loss.mean()
+                complex_latents = latents
+                simple_latents = latents
+
+                noise_scheduler.set_timesteps(50, device=accelerator.device)
+                timesteps = noise_scheduler.timesteps
+
+                for i, t in enumerate(timesteps[:49]):
+                    
+                    # predict the noise residual
+                    with torch.no_grad():
+                        complex_latent_model_input = torch.cat([complex_latents] * 2)
+                        simple_latent_model_input = torch.cat([simple_latents] * 2)
+
+                        complex_latent_model_input = noise_scheduler.scale_model_input(complex_latent_model_input, timestep=t)
+                        simple_latent_model_input = noise_scheduler.scale_model_input(simple_latent_model_input, timestep=t)
+
+                        complex_noise_pred = unet(complex_latent_model_input, t, encoder_hidden_states=complex_text_embeddings).sample
+                        simple_noise_pred = unet(simple_latent_model_input, t, encoder_hidden_states=simple_text_embeddings).sample
+
+                        # perform guidance
+                        complex_noise_pred_uncond, complex_noise_pred_text = complex_noise_pred.chunk(2)
+                        complex_noise_pred = complex_noise_pred_uncond + guidance_scale * (complex_noise_pred_text - complex_noise_pred_uncond)
+
+                        simple_noise_pred_uncond, simple_noise_pred_text = simple_noise_pred.chunk(2)
+                        simple_noise_pred = simple_noise_pred_uncond + guidance_scale * (simple_noise_pred_text - simple_noise_pred_uncond)
+
+                        # compute the previous noisy sample x_t -> x_t-1
+                        complex_latents = noise_scheduler.step(complex_noise_pred, t, complex_latents).prev_sample
+                        simple_latents = noise_scheduler.step(simple_noise_pred, t, simple_latents).prev_sample
+
+
+                complex_latent_model_input = torch.cat([complex_latents] * 2)
+                simple_latent_model_input = torch.cat([simple_latents] * 2)
+
+                complex_latent_model_input = noise_scheduler.scale_model_input(complex_latent_model_input, timestep=timesteps[49])
+                simple_latent_model_input = noise_scheduler.scale_model_input(simple_latent_model_input, timestep=timesteps[49])
+
+                complex_noise_pred = unet(complex_latent_model_input, timesteps[49], encoder_hidden_states=complex_text_embeddings).sample
+                simple_noise_pred = unet(simple_latent_model_input, timesteps[49], encoder_hidden_states=simple_text_embeddings).sample
+
+                # perform guidance
+                complex_noise_pred_uncond, complex_noise_pred_text = complex_noise_pred.chunk(2)
+                complex_noise_pred = complex_noise_pred_uncond + guidance_scale * (complex_noise_pred_text - complex_noise_pred_uncond)
+
+                simple_noise_pred_uncond, simple_noise_pred_text = simple_noise_pred.chunk(2)
+                simple_noise_pred = simple_noise_pred_uncond + guidance_scale * (simple_noise_pred_text - simple_noise_pred_uncond)
+
+                # compute the previous noisy sample x_t -> x_t-1
+                complex_latents = noise_scheduler.step(complex_noise_pred, timesteps[49], complex_latents).pred_original_sample.to(weight_dtype)
+                simple_latents = noise_scheduler.step(simple_noise_pred, timesteps[49], simple_latents).pred_original_sample.to(weight_dtype)
+
+                # scale and decode the image latents with vae
+                complex_latents = 1 / 0.18215 * complex_latents
+                simple_latents = 1 / 0.18215 * simple_latents
+
+                complex_image = vae.decode(complex_latents.to(weight_dtype)).sample
+                simple_image = vae.decode(simple_latents.to(weight_dtype)).sample
+
+                complex_image = (complex_image / 2 + 0.5).clamp(0, 1) # [batch,3,512,512]
+                simple_image = (simple_image / 2 + 0.5).clamp(0, 1)
+                # print("image_shape",image.shape)
+                # # =========save image
+                # image = image.detach().cpu().permute(0, 2, 3, 1).numpy() # (1, 512, 512, 3)
+                # images = (image * 255).round().astype("uint8")
+                # pil_images = [Image.fromarray(image) for image in images]
+
+                # pil_images[0].save(f"/home/khf/liutao/data/outputs/{id}_complex.png")
+                # pil_images[1].save(f"/home/khf/liutao/data/outputs/{id}_simple.png")
+                # print("save successfully!")
+               
+                # image encode
+                def _transform():
+                    return Compose([
+                        Resize(224, interpolation=BICUBIC),
+                        CenterCrop(224),
+                        Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+                    ])
+                
+                rm_preprocess = _transform()
+                complex_image = rm_preprocess(complex_image).to(accelerator.device)
+                simple_image = rm_preprocess(simple_image).to(accelerator.device)
+                print(complex_image.shape)
+                complex_rewards = reward_model.score_gard(batch["rm_complex_input_ids"], batch["rm_complex_attention_mask"], complex_image)
+
+                simple_rewards = reward_model.score_gard(batch["rm_simple_input_ids"], batch["rm_simple_attention_mask"], complex_image)
+
+                # print("complex rewards:",complex_rewards)
+                # print("simple rewards:",simple_rewards)
+
+                complex_loss = F.relu(complex_rewards+2)
+                simple_loss = F.relu(simple_rewards+2)
+
+                print("complex loss:",complex_loss)
+                print("simple loss:",simple_loss)
+                
+                # loss = F.relu(-rewards+2)
+                complex_loss = complex_loss.mean() * args.grad_scale
+                simple_loss = simple_loss.mean() * args.grad_scale
+
+                print("complex loss:",complex_loss)
+                print("simple loss:",simple_loss)
+                print(complex_loss.requires_grad)
+                print(simple_loss.requires_grad)
+                loss = complex_loss
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
@@ -830,7 +958,7 @@ def main():
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-
+            
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if args.use_ema:
@@ -839,39 +967,20 @@ def main():
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
-
+            
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
-
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                                )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
-
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
-
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
-
+            
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
                 break
-
+            
+        
         if accelerator.is_main_process:
             if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
                 if args.use_ema:
@@ -882,8 +991,9 @@ def main():
                 if args.use_ema:
                     # Switch back to the original UNet parameters.
                     ema_unet.restore(unet.parameters())
+        
 
-    # Create the pipeline using the trained modules and save it.
+     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         unet = accelerator.unwrap_model(unet)
@@ -899,9 +1009,6 @@ def main():
         )
         pipeline.save_pretrained(args.output_dir)
 
-
-
-
         if args.push_to_hub:
             upload_folder(
                 repo_id=repo_id,
@@ -912,6 +1019,8 @@ def main():
 
     accelerator.end_training()
 
-
+    
+    
+    
 if __name__ == "__main__":
     main()
