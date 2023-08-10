@@ -450,7 +450,7 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
     )
-    weight_path = "/home/khf/liutao/Diffusion_ReFL/models/weights/ImageReward.pt"
+    weight_path = "/home/khf/liutao/data/models/weights/ImageReward.pt"
     state_dict = torch.load(weight_path, map_location="cpu")
     med_config = "/home/khf/liutao/Diffusion_ReFL/configs/bert_config.json"
     reward_model = RM(med_config=med_config, device=accelerator.device).to(accelerator.device)
